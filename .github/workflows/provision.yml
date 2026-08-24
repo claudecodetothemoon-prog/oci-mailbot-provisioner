@@ -1,0 +1,141 @@
+name: provision-mailbot
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: provision-mailbot
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if already provisioned
+        id: done
+        run: echo "skip=$(test -f INSTANCE_IP.txt && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install OCI CLI
+        if: steps.done.outputs.skip == 'false'
+        run: pip install --quiet oci-cli
+
+      - name: Configure OCI
+        if: steps.done.outputs.skip == 'false'
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CLI_KEY }}" | base64 -d > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          region=${{ secrets.OCI_CLI_REGION }}
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Ensure network exists
+        if: steps.done.outputs.skip == 'false'
+        run: |
+          set -e
+          T="$OCI_CLI_TENANCY"
+          VCN=$(oci network vcn list --compartment-id "$T" --display-name mailbot-vcn --all 2>/dev/null | jq -r '.data[0].id // empty')
+          if [ -z "$VCN" ]; then
+            echo "creating vcn"
+            VCN=$(oci network vcn create --compartment-id "$T" --display-name mailbot-vcn --cidr-blocks '["10.0.0.0/24"]' | jq -r '.data.id')
+          fi
+          SL=$(oci network security-list list --compartment-id "$T" --vcn-id "$VCN" --all | jq -r '.data[0].id')
+          oci network security-list update --security-list-id "$SL" \
+            --security-list-rules '[
+              {"protocol":"6","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","direction":"INGRESS","tcp-options":{"destination-port-range":{"min":22,"max":22}}},
+              {"protocol":"1","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","direction":"INGRESS"},
+              {"protocol":"17","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","direction":"INGRESS"},
+              {"protocol":"all","destination":"0.0.0.0/0","destination-type":"CIDR_BLOCK","direction":"EGRESS"}
+            ]' --force
+          IGW=$(oci network internet-gateway list --compartment-id "$T" --vcn-id "$VCN" --all 2>/dev/null | jq -r '.data[0].id // empty')
+          if [ -z "$IGW" ]; then
+            IGW=$(oci network internet-gateway create --compartment-id "$T" --vcn-id "$VCN" --display-name mailbot-igw --enabled true | jq -r '.data.id')
+          fi
+          RT=$(oci network route-table list --compartment-id "$T" --vcn-id "$VCN" --all | jq -r '.data[0].id')
+          oci network route-table update --rt-id "$RT" \
+            --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destination-type\":\"CIDR_BLOCK\",\"network-entity-id\":\"$IGW\"}]" --force
+          SUBNET=$(oci network subnet list --compartment-id "$T" --vcn-id "$VCN" --display-name mailbot-subnet --all 2>/dev/null | jq -r '.data[0].id // empty')
+          if [ -z "$SUBNET" ]; then
+            SUBNET=$(oci network subnet create --compartment-id "$T" --vcn-id "$VCN" --display-name mailbot-subnet --cidr-block "10.0.0.16/28" | jq -r '.data.id')
+          fi
+          echo "SUBNET=$SUBNET" >> "$GITHUB_ENV"
+
+      - name: Launch instance
+        id: launch
+        if: steps.done.outputs.skip == 'false'
+        run: |
+          set -o pipefail
+          T="$OCI_CLI_TENANCY"
+          AD=$(oci iam availability-domain list --all | jq -r '.data[0].name')
+          echo "AD=$AD"
+          IMAGE=$(oci compute image list --compartment-id "$T" --operating-system "Canonical Ubuntu" --operating-system-version "22.04" --sort-by TIMECREATED --sort-order DESC --all | jq -r '[.data[] | select((.display-name | test("Minimal|aarch64")) | not)][0].id')
+          echo "IMAGE=$IMAGE"
+          echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBfMRL+2BeYEuL2ziPsFaoUmBwYO6D0cziJ93rpkh00m mailbot-setup" > pubkey.txt
+          if oci compute instance launch \
+            --availability-domain "$AD" \
+            --compartment-id "$T" \
+            --shape "VM.Standard.E2.1.Micro" \
+            --image-id "$IMAGE" \
+            --subnet-id "$SUBNET" \
+            --assign-public-ip true \
+            --display-name "mailbot" \
+            --ssh-authorized-keys-file pubkey.txt \
+            --wait-for-state PROVISIONING --max-wait-seconds 120 2>&1 | tee launch.log; then
+            echo "LAUNCH OK"
+          else
+            if grep -qi "out of host capacity\|Out of capacity\|NotEnoughHostCapacity" launch.log; then
+              echo "STILL_OUT_OF_CAPACITY"
+              exit 0
+            else
+              echo "UNEXPECTED FAILURE:"
+              tail -20 launch.log
+              exit 1
+            fi
+          fi
+
+      - name: Get public IP and record it
+        if: steps.done.outputs.skip == 'false' && steps.launch.outcome == 'success'
+        run: |
+          set -e
+          T="$OCI_CLI_TENANCY"
+          for i in $(seq 1 30); do
+            STATE=$(oci compute instance list --compartment-id "$T" --display-name mailbot --all | jq -r '.data[0]."lifecycle-state"')
+            echo "state=$STATE"
+            [ "$STATE" = "RUNNING" ] && break
+            sleep 20
+          done
+          IID=$(oci compute instance list --compartment-id "$T" --display-name mailbot --all | jq -r '.data[0].id')
+          for i in $(seq 1 20); do
+            IP=$(oci compute instance list-vnics --compartment-id "$T" --instance-id "$IID" | jq -r '.data[0]."public-ip" // empty')
+            [ -n "$IP" ] && break
+            sleep 15
+          done
+          echo "PUBLIC IP: $IP"
+          echo "$IP" > INSTANCE_IP.txt
+          git config user.name "mailbot-provisioner"
+          git config user.email "actions@github.com"
+          git add INSTANCE_IP.txt
+          git commit -m "mailbot VM created: $IP"
+          git push
