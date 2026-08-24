@@ -63,11 +63,13 @@ jobs:
           fi
           SL=$(oci network security-list list --compartment-id "$T" --vcn-id "$VCN" --all | jq -r '.data[0].id')
           oci network security-list update --security-list-id "$SL" \
-            --security-list-rules '[
-              {"protocol":"6","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","direction":"INGRESS","tcp-options":{"destination-port-range":{"min":22,"max":22}}},
-              {"protocol":"1","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","direction":"INGRESS"},
-              {"protocol":"17","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","direction":"INGRESS"},
-              {"protocol":"all","destination":"0.0.0.0/0","destination-type":"CIDR_BLOCK","direction":"EGRESS"}
+            --ingress-security-rules '[
+              {"protocol":"6","source":"0.0.0.0/0","source-type":"CIDR_BLOCK","tcp-options":{"destination-port-range":{"min":22,"max":22}}},
+              {"protocol":"1","source":"0.0.0.0/0","source-type":"CIDR_BLOCK"},
+              {"protocol":"17","source":"0.0.0.0/0","source-type":"CIDR_BLOCK"}
+            ]' \
+            --egress-security-rules '[
+              {"protocol":"all","destination":"0.0.0.0/0","destination-type":"CIDR_BLOCK"}
             ]' --force
           IGW=$(oci network internet-gateway list --compartment-id "$T" --vcn-id "$VCN" --all 2>/dev/null | jq -r '.data[0].id // empty')
           if [ -z "$IGW" ]; then
