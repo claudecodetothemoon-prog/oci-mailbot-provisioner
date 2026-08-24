@@ -92,7 +92,7 @@ jobs:
           T="$OCI_CLI_TENANCY"
           AD=$(oci iam availability-domain list --all | jq -r '.data[0].name')
           echo "AD=$AD"
-          IMAGE=$(oci compute image list --compartment-id "$T" --operating-system "Canonical Ubuntu" --operating-system-version "22.04" --sort-by TIMECREATED --sort-order DESC --all | jq -r '[.data[] | select((.display-name | test("Minimal|aarch64")) | not)][0].id')
+          IMAGE=$(oci compute image list --compartment-id "$T" --operating-system "Canonical Ubuntu" --operating-system-version "22.04" --sort-by TIMECREATED --sort-order DESC --all | jq -r '[.data[] | select((.["display-name"] | contains("Minimal")) | not) | select((.["display-name"] | contains("aarch64")) | not)][0].id')
           echo "IMAGE=$IMAGE"
           echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBfMRL+2BeYEuL2ziPsFaoUmBwYO6D0cziJ93rpkh00m mailbot-setup" > pubkey.txt
           if oci compute instance launch \
