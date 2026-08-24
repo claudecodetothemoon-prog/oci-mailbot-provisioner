@@ -73,7 +73,7 @@ jobs:
             ]' --force
           IGW=$(oci network internet-gateway list --compartment-id "$T" --vcn-id "$VCN" --all 2>/dev/null | jq -r '.data[0].id // empty')
           if [ -z "$IGW" ]; then
-            IGW=$(oci network internet-gateway create --compartment-id "$T" --vcn-id "$VCN" --display-name mailbot-igw --enabled true | jq -r '.data.id')
+            IGW=$(oci network internet-gateway create --compartment-id "$T" --vcn-id "$VCN" --display-name mailbot-igw --is-enabled true | jq -r '.data.id')
           fi
           RT=$(oci network route-table list --compartment-id "$T" --vcn-id "$VCN" --all | jq -r '.data[0].id')
           oci network route-table update --rt-id "$RT" \
